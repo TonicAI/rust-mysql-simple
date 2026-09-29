@@ -135,6 +135,22 @@ impl Stream {
             })
     }
 
+    /// Adopts a TCP connection the caller opened, which already reaches the
+    /// server. The connection is put in blocking mode, which this driver
+    /// requires, since one handed over from an async runtime is non-blocking.
+    pub fn from_tcp(
+        stream: net::TcpStream,
+        read_timeout: Option<Duration>,
+        write_timeout: Option<Duration>,
+        nodelay: bool,
+    ) -> MyResult<Stream> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(read_timeout)?;
+        stream.set_write_timeout(write_timeout)?;
+        stream.set_nodelay(nodelay)?;
+        Ok(Stream::TcpStream(TcpStream::Insecure(BufStream::new(stream))))
+    }
+
     pub fn is_insecure(&self) -> bool {
         matches!(self, Stream::TcpStream(TcpStream::Insecure(_)))
     }

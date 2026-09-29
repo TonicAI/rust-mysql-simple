@@ -415,6 +415,35 @@ impl Conn {
         Ok(conn)
     }
 
+    /// Creates new `Conn` over `stream`, a TCP connection that already reaches
+    /// the server, for a caller that opens the connection itself (through a
+    /// proxy, for example).
+    ///
+    /// The options' address and TCP settings are not used to connect, and the
+    /// connection is never moved to a local socket, even when the options name
+    /// a loopback host: that host is the server's own, not this machine's. TLS,
+    /// when configured, is negotiated over `stream` against the options' host.
+    pub fn new_with_stream<T, E>(opts: T, stream: std::net::TcpStream) -> Result<Conn>
+    where
+        Opts: TryFrom<T, Error = E>,
+        crate::Error: From<E>,
+    {
+        let opts = Opts::try_from(opts)?;
+        let stream = Stream::from_tcp(
+            stream,
+            opts.get_read_timeout().cloned(),
+            opts.get_write_timeout().cloned(),
+            opts.get_tcp_nodelay(),
+        )?;
+        let mut conn = Conn(Box::new(ConnInner::empty(opts)));
+        conn.0.stream = Some(MySyncFramed::new(stream));
+        conn.connect()?;
+        for cmd in conn.0.opts.get_init() {
+            conn.query_drop(cmd)?;
+        }
+        Ok(conn)
+    }
+
     fn exec_com_reset_connection(&mut self) -> Result<()> {
         self.write_command(Command::COM_RESET_CONNECTION, &[])?;
         let packet = self.read_packet()?;
@@ -1544,6 +1573,66 @@ mod test {
             if crate::test_misc::test_ssl() {
                 assert!(!conn.is_insecure());
             }
+        }
+
+        /// Opens the TCP connection a caller of `Conn::new_with_stream` would.
+        fn dial(opts: &Opts) -> std::net::TcpStream {
+            std::net::TcpStream::connect((
+                opts.get_ip_or_hostname().as_ref(),
+                opts.get_tcp_port(),
+            ))
+            .unwrap()
+        }
+
+        #[test]
+        fn should_connect_over_a_given_stream() {
+            let opts = Opts::from(get_opts());
+            let stream = dial(&opts);
+            let mut conn = Conn::new_with_stream(opts, stream).unwrap();
+
+            // The init commands ran, as they do for `Conn::new`.
+            let mode: String = conn
+                .query_first("SELECT @@GLOBAL.sql_mode")
+                .unwrap()
+                .unwrap();
+            assert!(mode.contains("TRADITIONAL"));
+            assert!(conn.ping().is_ok());
+            // A loopback host names the server's machine, not this one.
+            assert!(!conn.is_socket());
+
+            if crate::test_misc::test_ssl() {
+                assert!(!conn.is_insecure());
+            }
+        }
+
+        #[test]
+        fn should_connect_over_a_non_blocking_stream() {
+            let opts = Opts::from(get_opts());
+            let stream = dial(&opts);
+            stream.set_nonblocking(true).unwrap();
+
+            let mut conn = Conn::new_with_stream(opts, stream).unwrap();
+            assert!(conn.ping().is_ok());
+        }
+
+        #[test]
+        fn should_negotiate_tls_over_a_given_stream() {
+            let opts = Opts::from(
+                get_opts().ssl_opts(Some(
+                    crate::SslOpts::default()
+                        .with_danger_accept_invalid_certs(true)
+                        .with_danger_skip_domain_validation(true),
+                )),
+            );
+            let stream = dial(&opts);
+            let mut conn = Conn::new_with_stream(opts, stream).unwrap();
+
+            assert!(!conn.is_insecure());
+            let (_, cipher): (String, String) = conn
+                .query_first("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+                .unwrap()
+                .unwrap();
+            assert!(!cipher.is_empty());
         }
 
         #[test]
